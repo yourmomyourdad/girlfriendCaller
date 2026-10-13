@@ -1,69 +1,157 @@
+
 #!/usr/bin/env bash
-# Create a GitHub fork of MiroTalk C2C, configure Codespaces, and launch it.
-# Run from a Bash terminal with GitHub CLI (gh) installed.
+# MiroTalk C2C setup for an existing GitHub Codespace.
+# Installs the app, starts it, and configures automatic startup.
+
 set -Eeuo pipefail
 
-UPSTREAM="miroslavpejic85/mirotalkc2c"
-DEFAULT_REPO_NAME="our-video-call"
+UPSTREAM="https://github.com/miroslavpejic85/mirotalkc2c.git"
+TARGET_DIR="/workspaces/mirotalkc2c"
+WORKSPACE_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+DEVCONTAINER_DIR="$WORKSPACE_ROOT/.devcontainer"
+LOG_FILE="/tmp/mirotalk-c2c.log"
 
-say() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
-fail() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
+say() {
+  printf '\n==> %s\n' "$*"
+}
 
-command -v gh >/dev/null 2>&1 || fail "GitHub CLI (gh) is missing. Run this in a GitHub Codespaces terminal, or install GitHub CLI first."
-command -v git >/dev/null 2>&1 || fail "git is missing."
-command -v jq >/dev/null 2>&1 || fail "jq is missing. It is normally available in GitHub Codespaces."
+fail() {
+  printf '\nERROR: %s\n' "$*" >&2
+  exit 1
+}
 
-if ! gh auth status >/dev/null 2>&1; then
-  say "Signing in to GitHub"
-  gh auth login -h github.com -p https -w || fail "GitHub login failed."
+# Check prerequisites.
+for cmd in git node npm curl; do
+  command -v "$cmd" >/dev/null 2>&1 ||
+    fail "Missing required program: $cmd"
+done
+
+# If this script is running inside the MiroTalk repository,
+# use the current directory instead of cloning another copy.
+if [[ -f "$WORKSPACE_ROOT/package.json" ]] &&
+   node -e 'process.exit(require(process.argv[1]).name === "mirotalkc2c" ? 0 : 1)' \
+     "$WORKSPACE_ROOT/package.json" 2>/dev/null; then
+  TARGET_DIR="$WORKSPACE_ROOT"
 fi
 
-say "Checking GitHub permissions"
-# These scopes may require a one-time approval in the browser.
-gh auth refresh -h github.com -s repo -s codespace || fail "GitHub permissions were not granted."
-gh auth setup-git >/dev/null
+# Clone the official project if it does not exist yet.
+say "Finding MiroTalk C2C"
 
-LOGIN="$(gh api user --jq .login)"
-read -rp "Name for your copy of the project [$DEFAULT_REPO_NAME]: " REPO_NAME
-REPO_NAME="${REPO_NAME:-$DEFAULT_REPO_NAME}"
-REPO_NAME="$(printf '%s' "$REPO_NAME" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//')"
-[[ -n "$REPO_NAME" ]] || fail "That repository name is not valid."
-TARGET="$LOGIN/$REPO_NAME"
+if [[ -d "$TARGET_DIR" ]]; then
+  [[ -f "$TARGET_DIR/package.json" ]] ||
+    fail "$TARGET_DIR exists but is not a MiroTalk project."
 
-say "Preparing $TARGET"
-if gh repo view "$TARGET" >/dev/null 2>&1; then
-  PARENT="$(gh api "repos/$TARGET" --jq '.parent.full_name // ""' 2>/dev/null || true)"
-  if [[ "${PARENT,,}" != "${UPSTREAM,,}" ]]; then
-    fail "$TARGET already exists and is not a fork of $UPSTREAM. Re-run and choose a different repository name."
-  fi
-  echo "Found your existing fork; reusing it."
+  node -e 'process.exit(require(process.argv[1]).name === "mirotalkc2c" ? 0 : 1)' \
+    "$TARGET_DIR/package.json" 2>/dev/null ||
+    fail "$TARGET_DIR is not the MiroTalk C2C project."
+
+  echo "Using existing installation: $TARGET_DIR"
 else
-  gh repo fork "$UPSTREAM" --fork-name "$REPO_NAME" --clone=false --remote=false || \
-    fail "Could not fork $UPSTREAM. Check your GitHub permissions and try again."
+  mkdir -p "$(dirname "$TARGET_DIR")"
+  git clone "$UPSTREAM" "$TARGET_DIR"
 fi
 
-# Wait briefly for the new fork to become visible to GitHub's API.
-for _ in $(seq 1 30); do
-  if gh repo view "$TARGET" >/dev/null 2>&1; then break; fi
+cd "$TARGET_DIR"
+
+# Create local configuration if it doesn't exist.
+say "Preparing configuration"
+
+if [[ ! -f .env ]]; then
+  [[ -f .env.template ]] ||
+    fail "The project's .env.template file is missing."
+
+  cp .env.template .env
+  echo "Created .env"
+fi
+
+# Replace the known demo API secret if it is still present.
+if grep -q '^API_KEY_SECRET=mirotalkc2c_default_secret' .env; then
+  SECRET="$(node -e \
+    'console.log(require("crypto").randomBytes(32).toString("hex"))')"
+
+  sed -i \
+    "s/^API_KEY_SECRET=mirotalkc2c_default_secret.*/API_KEY_SECRET=$SECRET/" \
+    .env
+
+  echo "Generated a private API secret in .env"
+fi
+
+# Install dependencies.
+say "Installing dependencies"
+npm install --no-audit --no-fund
+
+# Create Codespaces helper scripts.
+mkdir -p "$DEVCONTAINER_DIR"
+
+cat > "$DEVCONTAINER_DIR/mirotalk-install.sh" <<'INSTALL'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+DIR="/workspaces/mirotalkc2c"
+
+if [[ ! -d "$DIR/.git" ]]; then
+  mkdir -p "$(dirname "$DIR")"
+  git clone https://github.com/miroslavpejic85/mirotalkc2c.git "$DIR"
+fi
+
+cd "$DIR"
+
+[[ -f .env ]] || cp .env.template .env
+
+npm install --no-audit --no-fund
+INSTALL
+
+cat > "$DEVCONTAINER_DIR/mirotalk-start.sh" <<'START'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+DIR="/workspaces/mirotalkc2c"
+LOG="/tmp/mirotalk-c2c.log"
+
+if [[ ! -f "$DIR/.env" ]]; then
+  bash /workspaces/girlfriendCaller/.devcontainer/mirotalk-install.sh
+fi
+
+# Do not start a second server if one is already responding.
+if curl -fsS --max-time 2 http://127.0.0.1:8080/ >/dev/null 2>&1; then
+  echo "MiroTalk is already running on port 8080."
+  exit 0
+fi
+
+# Start the application in the background.
+if ! pgrep -f '[n]ode backend/server.js' >/dev/null 2>&1; then
+  (cd "$DIR" && nohup npm start >"$LOG" 2>&1 </dev/null &)
+fi
+
+# Wait up to one minute for the server.
+for i in $(seq 1 30); do
+  if curl -fsS --max-time 2 http://127.0.0.1:8080/ >/dev/null 2>&1; then
+    echo "MiroTalk is running on port 8080."
+    exit 0
+  fi
+
   sleep 2
 done
-gh repo view "$TARGET" >/dev/null 2>&1 || fail "GitHub created the fork but it is not visible yet. Re-run this script in a minute."
-BRANCH="$(gh repo view "$TARGET" --json defaultBranchRef --jq '.defaultBranchRef.name')"
-[[ -n "$BRANCH" && "$BRANCH" != "null" ]] || fail "Could not determine the fork's default branch."
 
-WORKDIR="$(mktemp -d)"
-cleanup() { rm -rf "$WORKDIR"; }
-trap cleanup EXIT
-say "Cloning your fork and adding one-click Codespaces setup"
-git clone --single-branch --branch "$BRANCH" "https://github.com/$TARGET.git" "$WORKDIR"
-git -C "$WORKDIR" config user.name "$LOGIN"
-git -C "$WORKDIR" config user.email "$LOGIN@users.noreply.github.com"
-mkdir -p "$WORKDIR/.devcontainer"
+echo "The server did not start. Recent log:" >&2
+tail -n 60 "$LOG" 2>/dev/null || true
+exit 1
+START
 
-cat > "$WORKDIR/.devcontainer/devcontainer.json" <<'JSON'
+chmod +x \
+  "$DEVCONTAINER_DIR/mirotalk-install.sh" \
+  "$DEVCONTAINER_DIR/mirotalk-start.sh"
+
+# Configure Codespaces to forward port 8080 and start the server.
+say "Configuring automatic startup"
+
+DEVCONTAINER_JSON="$DEVCONTAINER_DIR/devcontainer.json"
+
+if [[ ! -f "$DEVCONTAINER_JSON" ]]; then
+  cat > "$DEVCONTAINER_JSON" <<'JSON'
 {
-  "name": "Our Video Call - MiroTalk C2C",
-  "image": "mcr.microsoft.com/devcontainers/javascript-node:1-22-bookworm",
+  "name": "MiroTalk C2C",
+  "image": "mcr.microsoft.com/devcontainers/universal:2",
   "forwardPorts": [8080],
   "portsAttributes": {
     "8080": {
@@ -71,133 +159,53 @@ cat > "$WORKDIR/.devcontainer/devcontainer.json" <<'JSON'
       "onAutoForward": "openBrowser"
     }
   },
-  "postCreateCommand": "bash .devcontainer/setup.sh",
-  "postStartCommand": "bash .devcontainer/start.sh",
-  "remoteUser": "node"
+  "postCreateCommand": "bash .devcontainer/mirotalk-install.sh",
+  "postStartCommand": "bash .devcontainer/mirotalk-start.sh"
 }
 JSON
-
-cat > "$WORKDIR/.devcontainer/setup.sh" <<'SETUP'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-cd "$(dirname "$0")/.."
-
-if [[ ! -f .env ]]; then
-  cp .env.template .env
-  # Replace the example API key with a random per-Codespace value.
-  if command -v openssl >/dev/null 2>&1; then
-    API_SECRET="$(openssl rand -hex 32)"
-    if grep -q '^API_KEY_SECRET=' .env; then
-      sed -i "s/^API_KEY_SECRET=.*/API_KEY_SECRET=${API_SECRET}/" .env
-    fi
-  fi
+  echo "Created devcontainer.json"
+else
+  echo "Existing devcontainer.json found; leaving it unchanged."
+  echo "You may need to add the settings shown below manually."
 fi
-npm ci
-SETUP
 
-cat > "$WORKDIR/.devcontainer/start.sh" <<'START'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-cd "$(dirname "$0")/.."
+# Start the app for this session.
+say "Starting MiroTalk"
 
 if curl -fsS --max-time 2 http://127.0.0.1:8080/ >/dev/null 2>&1; then
-  exit 0
-fi
-if ! pgrep -f '[n]ode backend/server.js' >/dev/null 2>&1; then
-  nohup npm start > /tmp/mirotalk-c2c.log 2>&1 </dev/null &
-fi
-for _ in $(seq 1 30); do
-  if curl -fsS --max-time 2 http://127.0.0.1:8080/ >/dev/null 2>&1; then
-    echo "MiroTalk C2C is running on port 8080."
-    exit 0
-  fi
-  sleep 2
-done
-echo "MiroTalk did not respond on port 8080. Recent server log:" >&2
-tail -n 60 /tmp/mirotalk-c2c.log 2>/dev/null || true
-exit 1
-START
+  echo "The server is already running."
+else
+  (cd "$TARGET_DIR" && nohup npm start >"$LOG_FILE" 2>&1 </dev/null &)
 
-chmod +x "$WORKDIR/.devcontainer/setup.sh" "$WORKDIR/.devcontainer/start.sh"
-git -C "$WORKDIR" add .devcontainer
-git -C "$WORKDIR" commit -m "Add automatic GitHub Codespaces setup" >/dev/null || {
-  echo "No setup changes to commit."
-}
-git -C "$WORKDIR" push origin "$BRANCH"
-
-say "Creating a GitHub Codespace"
-BEFORE_NAMES="$(gh codespace list --json name,repository --jq ".[] | select(.repository == \"$TARGET\") | .name" 2>/dev/null || true)"
-if ! gh codespace create \
-  --repo "$TARGET" \
-  --branch "$BRANCH" \
-  --devcontainer-path .devcontainer/devcontainer.json \
-  --display-name "Our Video Call" \
-  --idle-timeout 30m \
-  --retention-period 7d; then
-  echo
-  echo "Your GitHub repository is ready: https://github.com/$TARGET"
-  fail "The repository was set up, but GitHub could not create the Codespace. Check your Codespaces quota/billing and use Code > Codespaces on the repository to create it manually."
-fi
-
-say "Finding the new Codespace"
-CS_NAME=""
-for _ in $(seq 1 60); do
-  while IFS= read -r NAME; do
-    [[ -n "$NAME" ]] || continue
-    if ! printf '%s\n' "$BEFORE_NAMES" | grep -Fxq "$NAME"; then
-      CS_NAME="$NAME"
-      break
-    fi
-  done < <(gh codespace list --json name,repository --jq ".[] | select(.repository == \"$TARGET\") | .name" 2>/dev/null || true)
-  [[ -n "$CS_NAME" ]] && break
-  sleep 2
-done
-if [[ -z "$CS_NAME" ]]; then
-  echo "Repository setup succeeded: https://github.com/$TARGET"
-  echo "GitHub may still be preparing the Codespace. Check https://github.com/codespaces"
-  exit 0
-fi
-
-echo
-read -rp "Make port 8080 PUBLIC so your girlfriend can open the call without GitHub login? Anyone with the URL can access the app. [y/N]: " MAKE_PUBLIC
-if [[ "$MAKE_PUBLIC" =~ ^[Yy]$ ]]; then
-  say "Making the call app reachable by link"
-  # Wait for port detection before changing its visibility.
-  PORT_READY=0
-  for _ in $(seq 1 45); do
-    PORTS="$(gh codespace ports -c "$CS_NAME" --json sourcePort,browseUrl 2>/dev/null || true)"
-    if printf '%s' "$PORTS" | jq -e 'any(.[]; .sourcePort == 8080)' >/dev/null 2>&1; then
-      PORT_READY=1
+  for i in $(seq 1 30); do
+    if curl -fsS --max-time 2 http://127.0.0.1:8080/ >/dev/null 2>&1; then
       break
     fi
     sleep 2
   done
-  if [[ "$PORT_READY" == "1" ]]; then
-    gh codespace ports visibility 8080:public -c "$CS_NAME" || \
-      echo "Couldn't change visibility automatically; use the Codespaces Ports panel and set port 8080 to Public."
-  else
-    echo "Port 8080 has not appeared yet. After the Codespace finishes starting, set port 8080 to Public in the Ports panel."
-  fi
 fi
 
-APP_URL=""
-for _ in $(seq 1 30); do
-  APP_URL="$(gh codespace ports -c "$CS_NAME" --json sourcePort,browseUrl --jq '.[] | select(.sourcePort == 8080) | .browseUrl' 2>/dev/null | head -n 1 || true)"
-  [[ -n "$APP_URL" && "$APP_URL" != "null" ]] && break
-  sleep 2
-done
-
-printf '\n\033[1;32mSETUP COMPLETE\033[0m\n'
-printf 'Repository: https://github.com/%s\n' "$TARGET"
-printf 'Codespace:  %s\n' "$CS_NAME"
-if [[ -n "$APP_URL" && "$APP_URL" != "null" ]]; then
-  printf 'Call app:   %s\n' "$APP_URL"
-else
-  echo "Call app: port 8080 is being prepared. Open the Codespaces Ports panel to get its URL."
+if ! curl -fsS --max-time 2 http://127.0.0.1:8080/ >/dev/null 2>&1; then
+  echo "Startup failed. Recent server log:" >&2
+  tail -n 60 "$LOG_FILE" 2>/dev/null || true
+  exit 1
 fi
-printf '\nThe Codespace must remain running during calls. Stop it when you are done.\n'
-printf 'License note: MiroTalk C2C is AGPL-3.0; review its license before distributing modified versions.\n'
 
-# Ask GitHub CLI to open the editor if this environment supports it; setup remains
-# complete if automatic browser opening isn't available in this terminal.
-gh codespace code -c "$CS_NAME" --web >/dev/null 2>&1 || true
+printf '\n====================================\n'
+printf '       MIROTALK IS READY 💗\n'
+printf '====================================\n'
+printf 'App directory: %s\n' "$TARGET_DIR"
+printf 'Local address: http://localhost:8080\n'
+
+if [[ -n "${CODESPACE_NAME:-}" &&
+      -n "${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN:-}" ]]; then
+  printf 'Codespaces URL: https://%s-8080.%s\n' \
+    "$CODESPACE_NAME" "$GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN"
+fi
+
+printf '\nNext steps:\n'
+printf '1. Open the PORTS tab in Codespaces.\n'
+printf '2. Open port 8080 in your browser.\n'
+printf '3. Set port 8080 to Public if your girlfriend needs to connect without GitHub access.\n'
+printf '4. Keep the Codespace running during calls.\n'
+printf '\nServer log: %s\n' "$LOG_FILE"
