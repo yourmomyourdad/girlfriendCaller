@@ -1,0 +1,107 @@
+
+cat > "$WORKDIR/.devcontainer/start.sh" <<'START'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+cd "$(dirname "$0")/.."
+
+if curl -fsS --max-time 2 http://127.0.0.1:8080/ >/dev/null 2>&1; then
+  exit 0
+fi
+if ! pgrep -f '[n]ode backend/server.js' >/dev/null 2>&1; then
+  nohup npm start > /tmp/mirotalk-c2c.log 2>&1 </dev/null &
+fi
+for _ in $(seq 1 30); do
+  if curl -fsS --max-time 2 http://127.0.0.1:8080/ >/dev/null 2>&1; then
+    echo "MiroTalk C2C is running on port 8080."
+    exit 0
+  fi
+  sleep 2
+done
+echo "MiroTalk did not respond on port 8080. Recent server log:" >&2
+tail -n 60 /tmp/mirotalk-c2c.log 2>/dev/null || true
+exit 1
+START
+
+chmod +x "$WORKDIR/.devcontainer/setup.sh" "$WORKDIR/.devcontainer/start.sh"
+git -C "$WORKDIR" add .devcontainer
+git -C "$WORKDIR" commit -m "Add automatic GitHub Codespaces setup" >/dev/null || {
+  echo "No setup changes to commit."
+}
+git -C "$WORKDIR" push origin "$BRANCH"
+
+say "Creating a GitHub Codespace"
+BEFORE_NAMES="$(gh codespace list --json name,repository --jq ".[] | select(.repository == \"$TARGET\") | .name" 2>/dev/null || true)"
+if ! gh codespace create \
+  --repo "$TARGET" \
+  --branch "$BRANCH" \
+  --devcontainer-path .devcontainer/devcontainer.json \
+  --display-name "Our Video Call" \
+  --idle-timeout 30m \
+  --retention-period 7d; then
+  echo
+  echo "Your GitHub repository is ready: https://github.com/$TARGET"
+  fail "The repository was set up, but GitHub could not create the Codespace. Check your Codespaces quota/billing and use Code > Codespaces on the repository to create it manually."
+fi
+
+say "Finding the new Codespace"
+CS_NAME=""
+for _ in $(seq 1 60); do
+  while IFS= read -r NAME; do
+    [[ -n "$NAME" ]] || continue
+    if ! printf '%s\n' "$BEFORE_NAMES" | grep -Fxq "$NAME"; then
+      CS_NAME="$NAME"
+      break
+    fi
+  done < <(gh codespace list --json name,repository --jq ".[] | select(.repository == \"$TARGET\") | .name" 2>/dev/null || true)
+  [[ -n "$CS_NAME" ]] && break
+  sleep 2
+done
+if [[ -z "$CS_NAME" ]]; then
+  echo "Repository setup succeeded: https://github.com/$TARGET"
+  echo "GitHub may still be preparing the Codespace. Check https://github.com/codespaces"
+  exit 0
+fi
+
+echo
+read -rp "Make port 8080 PUBLIC so your girlfriend can open the call without GitHub login? Anyone with the URL can access the app. [y/N]: " MAKE_PUBLIC
+if [[ "$MAKE_PUBLIC" =~ ^[Yy]$ ]]; then
+  say "Making the call app reachable by link"
+  # Wait for port detection before changing its visibility.
+  PORT_READY=0
+  for _ in $(seq 1 45); do
+    PORTS="$(gh codespace ports -c "$CS_NAME" --json sourcePort,browseUrl 2>/dev/null || true)"
+    if printf '%s' "$PORTS" | jq -e 'any(.[]; .sourcePort == 8080)' >/dev/null 2>&1; then
+      PORT_READY=1
+      break
+    fi
+    sleep 2
+  done
+  if [[ "$PORT_READY" == "1" ]]; then
+    gh codespace ports visibility 8080:public -c "$CS_NAME" || \
+      echo "Couldn't change visibility automatically; use the Codespaces Ports panel and set port 8080 to Public."
+  else
+    echo "Port 8080 has not appeared yet. After the Codespace finishes starting, set port 8080 to Public in the Ports panel."
+  fi
+fi
+
+APP_URL=""
+for _ in $(seq 1 30); do
+  APP_URL="$(gh codespace ports -c "$CS_NAME" --json sourcePort,browseUrl --jq '.[] | select(.sourcePort == 8080) | .browseUrl' 2>/dev/null | head -n 1 || true)"
+  [[ -n "$APP_URL" && "$APP_URL" != "null" ]] && break
+  sleep 2
+done
+
+printf '\n\033[1;32mSETUP COMPLETE\033[0m\n'
+printf 'Repository: https://github.com/%s\n' "$TARGET"
+printf 'Codespace:  %s\n' "$CS_NAME"
+if [[ -n "$APP_URL" && "$APP_URL" != "null" ]]; then
+  printf 'Call app:   %s\n' "$APP_URL"
+else
+  echo "Call app: port 8080 is being prepared. Open the Codespaces Ports panel to get its URL."
+fi
+printf '\nThe Codespace must remain running during calls. Stop it when you are done.\n'
+printf 'License note: MiroTalk C2C is AGPL-3.0; review its license before distributing modified versions.\n'
+
+# Ask GitHub CLI to open the editor if this environment supports it; setup remains
+# complete if automatic browser opening isn't available in this terminal.
+gh codespace code -c "$CS_NAME" --web >/dev/null 2>&1 || true
